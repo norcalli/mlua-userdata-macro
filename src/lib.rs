@@ -179,15 +179,13 @@ fn generate_from_impl(
                 let method_impl = if is_mut {
                     quote! {
                         methods.add_method_mut(#method_name_str, |_, this, #args_param| {
-                            this.#method_name(#( #arg_names ),*);
-                            Ok(())
+                            Ok(this.#method_name(#( #arg_names ),*))
                         });
                     }
                 } else {
                     quote! {
                         methods.add_method(#method_name_str, |_, this, #args_param| {
-                            this.#method_name(#( #arg_names ),*);
-                            Ok(())
+                            Ok(this.#method_name(#( #arg_names ),*))
                         });
                     }
                 };
