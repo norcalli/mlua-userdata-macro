@@ -3,7 +3,7 @@ use mlua_userdata_macro::generate_userdata;
 
 #[generate_userdata]
 mod my_module {
-    #[derive(Debug, Clone)]
+    #[derive(mlua::FromLua, Debug, Clone)]
     pub struct MyStruct {
         pub value: i32,
         moo: i32,

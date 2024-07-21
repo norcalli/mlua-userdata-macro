@@ -1,15 +1,18 @@
 extern crate proc_macro;
+use std::collections::HashMap;
+
 use proc_macro::TokenStream;
-use quote::quote;
-use syn::{parse_macro_input, FnArg, ImplItem, ItemImpl, ItemMod, ItemStruct, Pat};
+use quote::{format_ident, quote, ToTokens};
+use syn::{parse_macro_input, parse_quote, FnArg, ImplItem, ItemImpl, ItemMod, ItemStruct, Pat};
 
 #[proc_macro_attribute]
 pub fn generate_userdata(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(item as ItemMod);
+    let mut input = parse_macro_input!(item as ItemMod);
 
     // Extract the module name and content
-    let mod_name = &input.ident;
-    let content = match &input.content {
+    // let mod_name = &input.ident;
+    let mut struct_data_map = HashMap::new();
+    let content = match &mut input.content {
         Some((_, items)) => items,
         None => {
             return syn::Error::new_spanned(&input, "Expected module content")
@@ -18,64 +21,104 @@ pub fn generate_userdata(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    // Find the struct and its impl block
-    let mut struct_item: Option<ItemStruct> = None;
-    let mut impl_item: Option<ItemImpl> = None;
-
-    for item in content {
+    for item in content.iter() {
         if let syn::Item::Struct(s) = item {
-            struct_item = Some(s.clone());
+            let struct_data = struct_data_map.entry(s.ident.to_string()).or_default();
+            generate_from_struct_def(struct_data, s)
         } else if let syn::Item::Impl(i) = item {
-            impl_item = Some(i.clone());
+            let struct_data = struct_data_map
+                .entry(i.self_ty.to_token_stream().to_string())
+                .or_default();
+            generate_from_impl(struct_data, i)
         }
     }
 
-    let struct_item = match struct_item {
-        Some(s) => s,
-        None => {
-            return syn::Error::new_spanned(&input, "Expected a struct definition")
-                .to_compile_error()
-                .into();
-        }
-    };
+    content.insert(
+        0,
+        parse_quote! {
+            use mlua::{UserData, UserDataMethods, UserDataFields, MetaMethod};
+        },
+    );
 
-    let impl_item = match impl_item {
-        Some(i) => i,
-        None => {
-            return syn::Error::new_spanned(&input, "Expected an impl block")
-                .to_compile_error()
-                .into();
-        }
-    };
+    for (struct_name, struct_data) in struct_data_map.drain() {
+        let StructData {
+            pub_fields,
+            methods,
+            accessors,
+            functions,
+            free_funcs,
+        } = struct_data;
+        let struct_name = format_ident!("{struct_name}");
+        content.push(parse_quote! {
+            impl UserData for #struct_name {
+                fn add_fields<'lua, F: UserDataFields<'lua, Self>>(fields: &mut F) {
+                    #( #accessors )*
+                    #( #pub_fields )*
+                }
 
-    let struct_name = &struct_item.ident;
-    let visibility = &struct_item.vis;
+                fn add_methods<'lua, M: UserDataMethods<'lua, Self>>(methods: &mut M) {
+                    #( #methods )*
+                    #( #functions )*
+                }
+            }
+        });
+        content.push(parse_quote! {
+            impl #struct_name {
+                pub fn free_functions_table(lua: &mlua::Lua) -> mlua::Result<mlua::Table> {
+                    let exports = lua.create_table()?;
+                    #( #free_funcs )*
+                    Ok(exports)
+                }
+            }
+        });
+    }
 
-    // Generate field accessors for pub fields
-    let pub_fields = struct_item.fields.iter().filter_map(|f| {
-        if matches!(f.vis, syn::Visibility::Public(_)) {
-            let field_name = f.ident.as_ref().unwrap();
-            let field_name_str = field_name.to_string();
-            Some(quote! {
-                fields.add_field_method_get(#field_name_str, |_, this| {
-                    Ok(this.#field_name.clone())
-                });
+    TokenStream::from(quote! { #input })
+}
 
-                fields.add_field_method_set(#field_name_str, |_, this, value| {
-                    this.#field_name = value;
-                    Ok(())
-                });
-            })
-        } else {
-            None
-        }
-    });
+fn generate_from_struct_def(struct_data: &mut StructData, struct_item: &ItemStruct) {
+    struct_data
+        .pub_fields
+        .extend(struct_item.fields.iter().filter_map(|f| {
+            if matches!(f.vis, syn::Visibility::Public(_)) {
+                let field_name = f.ident.as_ref().unwrap();
+                let field_name_str = field_name.to_string();
+                Some(quote! {
+                    fields.add_field_method_get(#field_name_str, |_, this| {
+                        Ok(this.#field_name.clone())
+                    });
 
-    // Generate UserData implementation
-    let mut methods = Vec::new();
-    let mut accessors = Vec::new();
-    let mut functions = Vec::new();
-    let mut free_funcs = Vec::new();
+                    fields.add_field_method_set(#field_name_str, |_, this, value| {
+                        this.#field_name = value;
+                        Ok(())
+                    });
+                })
+            } else {
+                None
+            }
+        }));
+}
+
+#[derive(Default)]
+struct StructData {
+    pub pub_fields: Vec<proc_macro2::TokenStream>,
+    pub methods: Vec<proc_macro2::TokenStream>,
+    pub accessors: Vec<proc_macro2::TokenStream>,
+    pub functions: Vec<proc_macro2::TokenStream>,
+    pub free_funcs: Vec<proc_macro2::TokenStream>,
+}
+
+fn generate_from_impl(
+    StructData {
+        pub_fields: _,
+        methods,
+        accessors,
+        functions,
+        free_funcs,
+    }: &mut StructData,
+    impl_item: &ItemImpl,
+) {
+    let struct_name = &impl_item.self_ty;
 
     for item in &impl_item.items {
         if let ImplItem::Fn(method) = item {
@@ -163,52 +206,4 @@ pub fn generate_userdata(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
     }
-
-    // // Generate FromLua implementation
-    // let from_lua_impl = quote! {
-    //     impl<'lua> mlua::FromLua<'lua> for #struct_name {
-    //         fn from_lua(lua_value: mlua::Value<'lua>, lua: &'lua mlua::Lua) -> mlua::Result<Self> {
-    //             use mlua::LuaSerdeExt;
-    //             let value: Self = lua.from_value(lua_value)?;
-    //             Ok(value)
-    //         }
-    //     }
-    // };
-
-    let expanded = quote! {
-        #visibility mod #mod_name {
-            use super::*;
-            use mlua::{UserData, UserDataMethods, UserDataFields, MetaMethod, FromLua};
-
-            // #[derive(Debug, Clone, FromLua)]
-            #[derive(FromLua)]
-            #struct_item
-
-            #impl_item
-
-            impl UserData for #struct_name {
-                fn add_fields<'lua, F: UserDataFields<'lua, Self>>(fields: &mut F) {
-                    #( #accessors )*
-                    #( #pub_fields )*
-                }
-
-                fn add_methods<'lua, M: UserDataMethods<'lua, Self>>(methods: &mut M) {
-                    #( #methods )*
-                    #( #functions )*
-                }
-            }
-
-            impl #struct_name {
-                pub fn free_functions_table(lua: &mlua::Lua) -> mlua::Result<mlua::Table> {
-                    let exports = lua.create_table()?;
-                    #( #free_funcs )*
-                    Ok(exports)
-                }
-            }
-
-            // #from_lua_impl
-        }
-    };
-
-    TokenStream::from(expanded)
 }
