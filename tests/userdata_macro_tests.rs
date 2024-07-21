@@ -1,5 +1,5 @@
 use expect_test::expect;
-use userdata_macro::generate_userdata;
+use mlua_userdata_macro::generate_userdata;
 
 #[generate_userdata]
 mod my_module {
